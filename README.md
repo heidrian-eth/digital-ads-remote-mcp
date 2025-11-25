@@ -1,22 +1,22 @@
-# Google Ads MCP - Remote Server
+# Digital Ads Remote MCP
 
-Remote deployment wrapper for [Google Ads MCP](https://github.com/googleads/google-ads-mcp).
+Remote deployment wrapper for digital ads MCP servers. Currently supports [Google Ads MCP](https://github.com/googleads/google-ads-mcp), with support for additional platforms coming soon.
 
 ## Features
 
 - **HTTP JSON-RPC Transport**: Cloud-native HTTP-based MCP server
 - **Stateless Architecture**: No session storage, scales to zero
 - **API Key Authentication**: Validate clients via API keys
-- **Per-Request Credentials**: Users provide their own Google Ads developer tokens
+- **Per-Request Credentials**: Users provide their own platform-specific credentials (e.g., Google Ads developer tokens)
 - **Multi-Cloud Ready**: Deploy to any container platform
 - **Auto-Updates**: Uses git submodule to track upstream changes
 
 ## Architecture
 
-This repository wraps the original `google-ads-mcp` as a git submodule and adds:
+This repository wraps digital ads MCP servers (such as `google-ads-mcp`) as git submodules and adds:
 - Remote server transport (HTTP JSON-RPC)
 - Authentication layer (API keys)
-- Credential injection (per-request developer tokens)
+- Credential injection (per-request platform credentials)
 - Container deployment configuration
 
 ## Local Development
@@ -24,17 +24,17 @@ This repository wraps the original `google-ads-mcp` as a git submodule and adds:
 ```bash
 # Clone with submodule
 git clone --recurse-submodules <your-repo-url>
-cd google-ads-mcp-remote
+cd digital-ads-remote-mcp
 
 # Build Docker image
-docker build -t google-ads-mcp-remote .
+docker build -t digital-ads-remote-mcp .
 
 # Run locally for testing
 docker run -p 8080:8080 \
   -e ALLOWED_API_KEYS="test-key-1,test-key-2" \
   -e GOOGLE_APPLICATION_CREDENTIALS="/path/to/credentials.json" \
   -v /path/to/credentials.json:/path/to/credentials.json:ro \
-  google-ads-mcp-remote
+  digital-ads-remote-mcp
 ```
 
 ## Deployment
@@ -43,11 +43,11 @@ docker run -p 8080:8080 \
 
 ```bash
 # Build and push to Google Container Registry
-gcloud builds submit --tag gcr.io/PROJECT_ID/google-ads-mcp-remote
+gcloud builds submit --tag gcr.io/PROJECT_ID/digital-ads-remote-mcp
 
 # Deploy to Cloud Run
-gcloud run deploy google-ads-mcp-remote \
-  --image=gcr.io/PROJECT_ID/google-ads-mcp-remote \
+gcloud run deploy digital-ads-remote-mcp \
+  --image=gcr.io/PROJECT_ID/digital-ads-remote-mcp \
   --platform=managed \
   --region=us-central1 \
   --allow-unauthenticated \
@@ -59,14 +59,14 @@ gcloud run deploy google-ads-mcp-remote \
 ```bash
 # Build and push to ECR
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
-docker build -t google-ads-mcp-remote .
-docker tag google-ads-mcp-remote:latest ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/google-ads-mcp-remote:latest
-docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/google-ads-mcp-remote:latest
+docker build -t digital-ads-remote-mcp .
+docker tag digital-ads-remote-mcp:latest ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/digital-ads-remote-mcp:latest
+docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/digital-ads-remote-mcp:latest
 
 # Deploy via AWS CLI (ensure task definition and service exist)
 aws ecs update-service \
   --cluster your-cluster \
-  --service google-ads-mcp-remote \
+  --service digital-ads-remote-mcp \
   --force-new-deployment
 ```
 
@@ -74,14 +74,14 @@ aws ecs update-service \
 
 ```bash
 # Build and push to Azure Container Registry
-az acr build --registry YOUR_ACR_NAME --image google-ads-mcp-remote:latest .
+az acr build --registry YOUR_ACR_NAME --image digital-ads-remote-mcp:latest .
 
 # Deploy to Azure Container Apps
 az containerapp create \
-  --name google-ads-mcp-remote \
+  --name digital-ads-remote-mcp \
   --resource-group YOUR_RESOURCE_GROUP \
   --environment YOUR_CONTAINER_APP_ENV \
-  --image YOUR_ACR_NAME.azurecr.io/google-ads-mcp-remote:latest \
+  --image YOUR_ACR_NAME.azurecr.io/digital-ads-remote-mcp:latest \
   --target-port 8080 \
   --ingress external \
   --env-vars ALLOWED_API_KEYS="key1,key2"
@@ -94,7 +94,7 @@ Configure MCP clients (Claude Desktop, etc.) to connect:
 ```json
 {
   "mcpServers": {
-    "google-ads-remote": {
+    "google-ads": {
       "url": "https://your-service-url/googleads/mcp",
       "transport": "http",
       "headers": {
@@ -147,7 +147,7 @@ git commit -m "Update google-ads-mcp submodule to latest"
 # Health check
 curl https://your-service-url/health
 
-# Test MCP endpoint
+# Test MCP endpoint (Google Ads example)
 curl -X POST https://your-service-url/googleads/mcp \
   -H "X-API-Key: your-api-key" \
   -H "X-Developer-Token: your-dev-token" \

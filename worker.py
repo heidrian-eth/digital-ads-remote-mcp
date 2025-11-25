@@ -29,7 +29,7 @@ def handle_request(body: dict) -> dict:
                     'tools': {'listChanged': False},
                 },
                 'serverInfo': {
-                    'name': 'google-ads-mcp-remote',
+                    'name': 'digital-ads-remote-mcp',
                     'version': '0.1.0'
                 }
             }

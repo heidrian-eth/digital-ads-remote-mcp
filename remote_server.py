@@ -93,7 +93,7 @@ def execute_mcp_request(body: dict, dev_token: str, login_customer_id: str = Non
 
 async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint for container platforms."""
-    return JSONResponse({'status': 'healthy', 'service': 'google-ads-mcp-remote'})
+    return JSONResponse({'status': 'healthy', 'service': 'digital-ads-remote-mcp'})
 
 
 async def handle_mcp_request(request: Request) -> JSONResponse:
@@ -183,7 +183,7 @@ def run(host: str = '0.0.0.0', port: int = 8080):
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    logger.info(f"Starting Google Ads MCP Remote Server on {host}:{port}")
+    logger.info(f"Starting Digital Ads Remote MCP Server on {host}:{port}")
     logger.info("Transport: HTTP JSON-RPC (subprocess isolation)")
     logger.info("Authentication: API Key + Per-request Developer Token")
 

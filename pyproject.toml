@@ -1,8 +1,8 @@
 [project]
-name = "google-ads-mcp-remote"
+name = "digital-ads-remote-mcp"
 version = "0.1.0"
 requires-python = ">=3.10"
-description = "Remote deployment wrapper for Google Ads MCP Server"
+description = "Remote deployment wrapper for digital ads MCP servers"
 readme = "README.md"
 license = "Apache-2.0"
 
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-google-ads-mcp-remote = "remote_server:run"
+digital-ads-remote-mcp = "remote_server:run"
 
 [build-system]
 requires = ["setuptools>=61.0"]
