@@ -1,0 +1,11 @@
+.git
+.gitmodules
+*.pyc
+__pycache__
+*.egg-info
+.pytest_cache
+.venv
+venv/
+*.md
+.gitignore
+.github/
