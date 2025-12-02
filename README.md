@@ -1,6 +1,9 @@
 # Digital Ads Remote MCP
 
-Remote deployment wrapper for digital ads MCP servers. Currently supports [Google Ads MCP](https://github.com/googleads/google-ads-mcp), with support for additional platforms coming soon.
+Remote deployment wrapper for digital ads MCP servers. Currently supports:
+- [Google Ads MCP](https://github.com/googleads/google-ads-mcp) → `/googleads/mcp`
+- [Google Analytics MCP](https://github.com/googleanalytics/google-analytics-mcp) → `/analytics/mcp`
+- [Facebook Ads MCP](https://github.com/gomarble-ai/facebook-ads-mcp-server) → `/facebookads/mcp`
 
 ## Features
 
@@ -87,51 +90,145 @@ az containerapp create \
   --env-vars ALLOWED_API_KEYS="key1,key2"
 ```
 
+## Encryption Setup
+
+Environment variables can be encrypted using ECIES (Elliptic Curve Integrated Encryption Scheme) with secp256k1.
+
+### Generate Key Pair
+
+```bash
+# Install eciespy
+pip install eciespy
+
+# Generate key pair
+python3 -c "
+import ecies
+import secrets
+
+# Generate private key (32 bytes hex)
+private_key = secrets.token_hex(32)
+# Derive public key
+public_key = ecies.utils.generate_eth_key().hex()
+
+# Or generate both properly:
+from ecies import generate_key
+sk = generate_key()
+print(f'Private key (keep secret): {sk.to_hex()}')
+print(f'Public key (for clients):  {sk.public_key.format(True).hex()}')
+"
+```
+
+Or using OpenSSL:
+
+```bash
+# Generate private key
+openssl ecparam -name secp256k1 -genkey -noout -out private.pem
+
+# Extract raw hex private key for ECIES_PRIVATE_KEY env var
+openssl ec -in private.pem -text -noout 2>/dev/null | grep -A3 'priv:' | tail -n3 | tr -d ' :\n'
+
+# Extract public key for clients
+openssl ec -in private.pem -pubout -outform DER 2>/dev/null | tail -c 65 | xxd -p -c 65
+```
+
+### Encrypt Values (Client-Side)
+
+```bash
+# Encrypt a string
+python3 -c "
+import ecies
+import base64
+import sys
+
+public_key = 'YOUR_PUBLIC_KEY_HEX'
+plaintext = sys.argv[1]
+
+ciphertext = ecies.encrypt(public_key, plaintext.encode())
+print(base64.urlsafe_b64encode(ciphertext).decode())
+" "your-secret-value"
+
+# Encrypt a file
+python3 -c "
+import ecies
+import base64
+import sys
+
+public_key = 'YOUR_PUBLIC_KEY_HEX'
+with open(sys.argv[1], 'rb') as f:
+    content = f.read()
+
+ciphertext = ecies.encrypt(public_key, content)
+print(base64.urlsafe_b64encode(ciphertext).decode())
+" credentials.json
+```
+
 ## Client Configuration
 
-Configure MCP clients (Claude Desktop, etc.) to connect:
+Environment variables are passed via query parameters with type prefixes:
+
+| Prefix | Description | Example |
+|--------|-------------|---------|
+| `PLAIN_` | Plaintext value | `?PLAIN_FOO=bar` → `FOO=bar` |
+| `FILE_` | Content written to temp file | `?FILE_CREDS={}` → `CREDS=/tmp/xxx.json` |
+| `ENC_` | Encrypted value (base64url) | `?ENC_TOKEN=abc...` → `TOKEN=decrypted` |
+| `ENCFILE_` | Encrypted content to temp file | `?ENCFILE_CREDS=abc...` → `CREDS=/tmp/xxx.json` |
+
+### MCP Client Configuration
 
 ```json
 {
   "mcpServers": {
     "google-ads": {
-      "url": "https://your-service-url/googleads/mcp",
-      "transport": "http",
-      "headers": {
-        "X-API-Key": "your-api-key",
-        "X-Developer-Token": "your-google-ads-developer-token",
-        "X-Login-Customer-ID": "optional-manager-customer-id"
-      }
+      "url": "https://your-service-url/googleads/mcp?api_key=your-api-key&ENC_GOOGLE_ADS_DEVELOPER_TOKEN=abc123...&PLAIN_GOOGLE_ADS_LOGIN_CUSTOMER_ID=1234567890",
+      "transport": "http"
+    },
+    "google-analytics": {
+      "url": "https://your-service-url/analytics/mcp?api_key=your-api-key&ENCFILE_GOOGLE_APPLICATION_CREDENTIALS=xyz789...",
+      "transport": "http"
+    },
+    "facebook-ads": {
+      "url": "https://your-service-url/facebookads/mcp?api_key=your-api-key&ENC_FB_ACCESS_TOKEN=abc123...",
+      "transport": "http"
     }
   }
 }
 ```
 
-### Required Headers
+### Required Parameters
 
-- `X-API-Key`: API key for authentication (validated against `ALLOWED_API_KEYS`)
-- `X-Developer-Token`: Google Ads API developer token (per-user)
-- `X-Login-Customer-ID`: (Optional) Manager customer ID for account access
+**Google Ads MCP** (`/googleads/mcp`):
+- `GOOGLE_ADS_DEVELOPER_TOKEN`: Your Google Ads API developer token
+- `GOOGLE_ADS_LOGIN_CUSTOMER_ID`: (Optional) Manager customer ID
+- `GOOGLE_APPLICATION_CREDENTIALS`: (Optional) Path to service account JSON (use `FILE_` or `ENCFILE_` prefix)
+
+**Google Analytics MCP** (`/analytics/mcp`):
+- `GOOGLE_APPLICATION_CREDENTIALS`: Path to service account JSON (use `FILE_` or `ENCFILE_` prefix)
+- `ANALYTICS_PROPERTY_ID`: (Optional) Default GA4 property ID
+
+**Facebook Ads MCP** (`/facebookads/mcp`):
+- `FB_ACCESS_TOKEN`: Facebook User Access Token with `ads_read` permission (required)
 
 ## Keeping Up-to-Date
 
-The original `google-ads-mcp` is included as a git submodule. To update:
+The MCP servers are included as git submodules. To update:
 
 ```bash
-# Update submodule to latest version
+# Update all submodules to latest version
 git submodule update --remote
 
-# Commit the update
-git add google-ads-mcp
-git commit -m "Update google-ads-mcp submodule to latest"
+# Commit the updates
+git add google-ads-mcp google-analytics-mcp facebook-ads-mcp
+git commit -m "Update MCP submodules to latest"
 
 # Redeploy to your platform
 ```
 
 ## Environment Variables
 
+Server-side environment variables:
+
 - `ALLOWED_API_KEYS`: Comma-separated list of valid API keys
-- `GOOGLE_APPLICATION_CREDENTIALS`: Path to service account credentials (auto-set by most container platforms)
+- `ECIES_PRIVATE_KEY`: Hex-encoded secp256k1 private key for decrypting `ENC_*` and `ENCFILE_*` parameters
 
 ## Security Considerations
 
@@ -147,20 +244,31 @@ git commit -m "Update google-ads-mcp submodule to latest"
 # Health check
 curl https://your-service-url/health
 
-# Test MCP endpoint (Google Ads example)
-curl -X POST https://your-service-url/googleads/mcp \
-  -H "X-API-Key: your-api-key" \
-  -H "X-Developer-Token: your-dev-token" \
+# Google Ads - list tools
+curl -X POST "https://your-service-url/googleads/mcp?api_key=your-api-key&PLAIN_GOOGLE_ADS_DEVELOPER_TOKEN=your-dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+
+# Google Analytics - list tools (with service account file)
+curl -X POST "https://your-service-url/analytics/mcp?api_key=your-api-key&FILE_GOOGLE_APPLICATION_CREDENTIALS=$(cat sa.json)" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+
+# Facebook Ads - list tools
+curl -X POST "https://your-service-url/facebookads/mcp?api_key=your-api-key&PLAIN_FB_ACCESS_TOKEN=your-fb-token" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
 ```
 
 ## Troubleshooting
 
-- **401 Unauthorized**: Check API key in `ALLOWED_API_KEYS`
-- **400 Missing Token**: Include `X-Developer-Token` header
-- **500 Internal Error**: Check container logs for Google Ads API errors
+- **401 Unauthorized**: Check `api_key` query param matches `ALLOWED_API_KEYS`
+- **400 Invalid params**: Check encryption/decryption - ensure `ECIES_PRIVATE_KEY` is set
+- **500 Internal Error**: Check container logs for MCP or API errors
 
 ## License
 
-Same as [google-ads-mcp](https://github.com/googleads/google-ads-mcp) - Apache 2.0
+Apache 2.0 / MIT (same as upstream MCP servers:
+[google-ads-mcp](https://github.com/googleads/google-ads-mcp),
+[google-analytics-mcp](https://github.com/googleanalytics/google-analytics-mcp),
+[facebook-ads-mcp](https://github.com/gomarble-ai/facebook-ads-mcp-server))

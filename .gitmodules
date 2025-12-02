@@ -1,3 +1,9 @@
 [submodule "google-ads-mcp"]
 	path = google-ads-mcp
 	url = https://github.com/googleads/google-ads-mcp
+[submodule "google-analytics-mcp"]
+	path = google-analytics-mcp
+	url = https://github.com/googleanalytics/google-analytics-mcp.git
+[submodule "facebook-ads-mcp"]
+	path = facebook-ads-mcp
+	url = https://github.com/gomarble-ai/facebook-ads-mcp-server.git
