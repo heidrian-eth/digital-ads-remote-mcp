@@ -97,38 +97,26 @@ Environment variables can be encrypted using ECIES (Elliptic Curve Integrated En
 ### Generate Key Pair
 
 ```bash
-# Install eciespy
+# Install eciespy (uses coincurve under the hood)
 pip install eciespy
 
-# Generate key pair
+# Generate a new key pair
 python3 -c "
-import ecies
+from coincurve import PrivateKey
 import secrets
 
-# Generate private key (32 bytes hex)
-private_key = secrets.token_hex(32)
-# Derive public key
-public_key = ecies.utils.generate_eth_key().hex()
-
-# Or generate both properly:
-from ecies import generate_key
-sk = generate_key()
-print(f'Private key (keep secret): {sk.to_hex()}')
-print(f'Public key (for clients):  {sk.public_key.format(True).hex()}')
+sk = PrivateKey(secrets.token_bytes(32))
+print(f'Private key (keep secret): {sk.secret.hex()}')
+print(f'Public key (for clients):  {sk.public_key.format(False).hex()}')
 "
-```
 
-Or using OpenSSL:
-
-```bash
-# Generate private key
-openssl ecparam -name secp256k1 -genkey -noout -out private.pem
-
-# Extract raw hex private key for ECIES_PRIVATE_KEY env var
-openssl ec -in private.pem -text -noout 2>/dev/null | grep -A3 'priv:' | tail -n3 | tr -d ' :\n'
-
-# Extract public key for clients
-openssl ec -in private.pem -pubout -outform DER 2>/dev/null | tail -c 65 | xxd -p -c 65
+# Derive public key from an existing hex private key
+python3 -c "
+from coincurve import PrivateKey
+private_key_hex = 'YOUR_PRIVATE_KEY_HEX'
+sk = PrivateKey(bytes.fromhex(private_key_hex))
+print(sk.public_key.format(False).hex())
+"
 ```
 
 ### Encrypt Values (Client-Side)
@@ -144,7 +132,7 @@ public_key = 'YOUR_PUBLIC_KEY_HEX'
 plaintext = sys.argv[1]
 
 ciphertext = ecies.encrypt(public_key, plaintext.encode())
-print(base64.urlsafe_b64encode(ciphertext).decode())
+print(base64.urlsafe_b64encode(ciphertext).decode().rstrip('='))
 " "your-secret-value"
 
 # Encrypt a file
@@ -158,7 +146,7 @@ with open(sys.argv[1], 'rb') as f:
     content = f.read()
 
 ciphertext = ecies.encrypt(public_key, content)
-print(base64.urlsafe_b64encode(ciphertext).decode())
+print(base64.urlsafe_b64encode(ciphertext).decode().rstrip('='))
 " credentials.json
 ```
 
@@ -203,6 +191,7 @@ Environment variables are passed via query parameters with type prefixes:
 
 **Google Analytics MCP** (`/analytics/mcp`):
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to service account JSON (use `FILE_` or `ENCFILE_` prefix)
+- `GOOGLE_PROJECT_ID`: Google Cloud project ID
 - `ANALYTICS_PROPERTY_ID`: (Optional) Default GA4 property ID
 
 **Facebook Ads MCP** (`/facebookads/mcp`):
