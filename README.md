@@ -227,26 +227,51 @@ Server-side environment variables:
 4. **Service Account**: Use minimal permissions for Google Ads API access
 5. **CORS**: Configure `allow_origins` in production
 
+## Transport
+
+The server speaks the **MCP Streamable HTTP** transport at `POST /{service}/mcp`.
+Session state is tracked via the `Mcp-Session-Id` response/request header:
+
+1. First request (`initialize`) is sent without a session header. Env-injection
+   query params (`PLAIN_*`, `FILE_*`, `ENC_*`, `ENCFILE_*`) are read here and
+   configure the spawned stdio subprocess.
+2. The server returns an `Mcp-Session-Id` header; all subsequent requests for
+   that session MUST include it.
+3. `DELETE /{service}/mcp` with the header closes the session.
+
+Responses are returned as `text/event-stream`; the final event carries the
+JSON-RPC response. Notification-only requests return `202 Accepted`.
+
 ## Testing
 
 ```bash
 # Health check
 curl https://your-service-url/health
 
-# Google Ads - list tools
-curl -X POST "https://your-service-url/googleads/mcp?api_key=your-api-key&PLAIN_GOOGLE_ADS_DEVELOPER_TOKEN=your-dev-token" \
+# Initialize (captures the Mcp-Session-Id from response headers)
+SID=$(curl -sD - -o /dev/null \
+  -X POST "https://your-service-url/googleads/mcp?api_key=your-api-key&PLAIN_GOOGLE_ADS_DEVELOPER_TOKEN=your-dev-token" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' \
+  | awk 'tolower($1)=="mcp-session-id:"{print $2}' | tr -d '\r')
 
-# Google Analytics - list tools (with service account file)
-curl -X POST "https://your-service-url/analytics/mcp?api_key=your-api-key&FILE_GOOGLE_APPLICATION_CREDENTIALS=$(cat sa.json)" \
+# Subsequent calls reuse the session id via the header
+curl -X POST "https://your-service-url/googleads/mcp?api_key=your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
-# Facebook Ads - list tools
-curl -X POST "https://your-service-url/facebookads/mcp?api_key=your-api-key&PLAIN_FB_ACCESS_TOKEN=your-fb-token" \
+curl -X POST "https://your-service-url/googleads/mcp?api_key=your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# Close the session
+curl -X DELETE "https://your-service-url/googleads/mcp?api_key=your-api-key" \
+  -H "Mcp-Session-Id: $SID"
 ```
 
 ## Troubleshooting

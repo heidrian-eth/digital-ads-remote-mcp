@@ -1,12 +1,25 @@
 """
-Remote MCP Server Wrapper for Google Ads MCP.
+Remote MCP Server Wrapper (Streamable HTTP transport).
 
-This wrapper:
-- Spawns the google-ads-mcp command via subprocess with injected credentials
-- Adds HTTP JSON-RPC transport (replacing stdio)
-- Validates API keys from X-API-Key header
-- Injects per-request credentials as subprocess environment variables
-- Deployable to any container platform (Cloud Run, Fargate, Azure Container Apps, etc.)
+Exposes each wrapped MCP server at a single `/mcp` endpoint:
+
+- `POST /{service}/mcp` — send a JSON-RPC request, notification, or batch.
+  - For requests: response body is a `text/event-stream` whose final event
+    carries the matching JSON-RPC response. Intermediate events may carry
+    progress notifications emitted by the underlying MCP server.
+  - For notifications only: returns 202 Accepted with no body.
+- `DELETE /{service}/mcp` — close the session identified by `Mcp-Session-Id`.
+
+Session lifecycle:
+- The first request (`initialize`) is sent without an `Mcp-Session-Id` header.
+  The server spawns the underlying MCP command as a stdio subprocess, forwards
+  the request, and returns the subprocess's response stream. The response
+  includes an `Mcp-Session-Id` header the client MUST send on all subsequent
+  requests for the same session.
+- Env-injection query parameters (`PLAIN_*`, `FILE_*`, `ENC_*`, `ENCFILE_*`)
+  are read only on the initialize request; they configure the subprocess env.
+
+Auth: `api_key` query parameter, validated against `ALLOWED_API_KEYS`.
 """
 
 import os
@@ -15,6 +28,10 @@ import logging
 import asyncio
 import shutil
 import base64
+import uuid
+import tempfile
+import shlex
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import ecies
 
@@ -23,20 +40,17 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Route
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-import uuid
-import tempfile
-import shlex
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# SSE Session Management
+# MCP stdio subprocess session
 # =============================================================================
 
 class MCPSession:
-    """Manages a persistent MCP subprocess session."""
+    """Persistent stdio subprocess bridging JSON-RPC over HTTP."""
 
     def __init__(
         self,
@@ -49,57 +63,93 @@ class MCPSession:
         self.temp_files = temp_files
         self.lock = asyncio.Lock()
         self._closed = False
-        self._read_buffer = b''  # Buffer for incomplete lines
+        self._read_buffer = b''
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-    async def send_message(self, message: dict) -> None:
-        """Send a JSON-RPC message to the subprocess stdin."""
-        if self._closed or self.proc.stdin is None:
-            raise RuntimeError("Session is closed")
-        async with self.lock:
-            data = json.dumps(message) + '\n'
-            print(f"[DEBUG] Session {self.session_id} SENDING: {data.strip()}")
-            self.proc.stdin.write(data.encode())
-            await self.proc.stdin.drain()
+    async def _drain_stderr(self) -> None:
+        if self.proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+                print(f"[STDERR:{self.session_id[:8]}] {line.decode().rstrip()}")
+        except Exception as e:
+            print(f"[DEBUG] stderr drain error for {self.session_id}: {e}")
 
-    async def read_line(self) -> str | None:
-        """Read a line from subprocess stdout.
-
-        Handles large JSON responses that exceed readline()'s default 64KB limit
-        by reading in chunks and maintaining a buffer.
-        """
+    async def _read_line(self) -> str | None:
+        """Read one line from subprocess stdout, buffered to bypass 64KB readline cap."""
         if self._closed or self.proc.stdout is None:
-            print(f"[DEBUG] Session {self.session_id} read_line: closed or no stdout")
             return None
         try:
-            # Keep reading until we have a complete line
             while b'\n' not in self._read_buffer:
-                chunk = await self.proc.stdout.read(65536)  # Read 64KB at a time
+                chunk = await self.proc.stdout.read(65536)
                 if not chunk:
-                    # EOF - return whatever we have buffered
                     if self._read_buffer:
                         line = self._read_buffer
                         self._read_buffer = b''
-                        decoded = line.decode().strip()
-                        print(f"[DEBUG] Session {self.session_id} RECEIVED EOF ({len(decoded)} bytes): {decoded[:200]}...")
-                        return decoded
-                    print(f"[DEBUG] Session {self.session_id} read_line: EOF")
+                        return line.decode().strip()
                     return None
                 self._read_buffer += chunk
-
-            # Split on first newline
             line, self._read_buffer = self._read_buffer.split(b'\n', 1)
-            decoded = line.decode().strip()
-            print(f"[DEBUG] Session {self.session_id} RECEIVED ({len(decoded)} bytes): {decoded[:200]}...")
-            return decoded
+            return line.decode().strip()
         except Exception as e:
-            print(f"[DEBUG] Session {self.session_id} read_line error: {e}")
+            print(f"[DEBUG] Session {self.session_id} read error: {e}")
             return None
 
+    async def process_jsonrpc(self, body: Any) -> AsyncIterator[str]:
+        """Send a JSON-RPC message/batch; yield stdout lines until all expected responses arrive.
+
+        Holds the session lock for the full round-trip so concurrent POSTs on the
+        same session are serialized against the stdio pipes.
+        """
+        if self._closed or self.proc.stdin is None:
+            raise RuntimeError("Session is closed")
+
+        expected_ids = _collect_request_ids(body)
+
+        async with self.lock:
+            data = (json.dumps(body) + '\n').encode()
+            print(f"[DEBUG] Session {self.session_id} -> {data[:200]!r}")
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
+
+            if not expected_ids:
+                return
+
+            seen_ids: set = set()
+            while seen_ids < expected_ids:
+                line = await self._read_line()
+                if line is None:
+                    break
+                if not line:
+                    continue
+                print(f"[DEBUG] Session {self.session_id} <- {line[:200]}")
+                yield line
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msgs = parsed if isinstance(parsed, list) else [parsed]
+                for m in msgs:
+                    if (
+                        isinstance(m, dict)
+                        and 'id' in m
+                        and ('result' in m or 'error' in m)
+                    ):
+                        seen_ids.add(m['id'])
+
     async def close(self) -> None:
-        """Close the session and cleanup resources."""
         if self._closed:
             return
         self._closed = True
+
+        self._stderr_task.cancel()
+        try:
+            await self._stderr_task
+        except asyncio.CancelledError:
+            pass
 
         try:
             if self.proc.stdin:
@@ -112,7 +162,6 @@ class MCPSession:
         except Exception as e:
             logger.warning(f"Error closing session {self.session_id}: {e}")
 
-        # Clean up temp files
         for path in self.temp_files:
             try:
                 os.unlink(path)
@@ -120,7 +169,6 @@ class MCPSession:
                 pass
 
 
-# Global session registry
 _sessions: dict[str, MCPSession] = {}
 _sessions_lock = asyncio.Lock()
 
@@ -130,24 +178,18 @@ async def create_mcp_session(
     env_vars: dict[str, str] | None = None,
     env_file_vars: dict[str, str] | None = None,
 ) -> MCPSession:
-    """Create a new MCP subprocess session."""
-    print(f"[DEBUG] create_mcp_session: command={command}")
     args = shlex.split(command)
     if not args:
         raise ValueError("Empty command")
 
-    # Resolve command path
     executable = shutil.which(args[0]) or args[0]
     args[0] = executable
-    print(f"[DEBUG] Resolved executable: {executable}")
 
-    # Build environment
     env = os.environ.copy()
     if env_vars:
         env.update(env_vars)
 
-    # Create temp files for file-based env vars
-    temp_files = []
+    temp_files: list[str] = []
     if env_file_vars:
         for var_name, content in env_file_vars.items():
             tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
@@ -156,7 +198,6 @@ async def create_mcp_session(
             temp_files.append(tmp.name)
             env[var_name] = tmp.name
 
-    print(f"[DEBUG] Spawning subprocess: {args}")
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,
@@ -164,7 +205,6 @@ async def create_mcp_session(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    print(f"[DEBUG] Subprocess spawned, PID: {proc.pid}")
 
     session_id = str(uuid.uuid4())
     session = MCPSession(session_id, proc, temp_files)
@@ -172,593 +212,273 @@ async def create_mcp_session(
     async with _sessions_lock:
         _sessions[session_id] = session
 
-    print(f"[DEBUG] Session registered: {session_id}")
     logger.info(f"Created MCP session {session_id} for command: {command}")
     return session
 
 
 async def get_session(session_id: str) -> MCPSession | None:
-    """Get a session by ID."""
     async with _sessions_lock:
         return _sessions.get(session_id)
 
 
 async def remove_session(session_id: str) -> None:
-    """Remove and close a session."""
     async with _sessions_lock:
         session = _sessions.pop(session_id, None)
     if session:
         await session.close()
         logger.info(f"Removed MCP session {session_id}")
 
-# Private key for decryption (hex-encoded secp256k1 private key)
+
+# =============================================================================
+# Crypto + env param parsing
+# =============================================================================
+
 DECRYPT_PRIVATE_KEY = os.environ.get('ECIES_PRIVATE_KEY', '')
 
 
 def decrypt_value(encrypted_b64url: str) -> str:
-    """
-    Decrypt a base64url-encoded ECIES ciphertext.
-
-    Args:
-        encrypted_b64url: Base64url-encoded ciphertext
-
-    Returns:
-        Decrypted plaintext string
-
-    Raises:
-        ValueError: If decryption fails or private key not configured
-    """
     if not DECRYPT_PRIVATE_KEY:
         raise ValueError("ECIES_PRIVATE_KEY environment variable not set")
 
-    # Validate base64url string length
-    # Valid lengths are 4n, 4n+2, or 4n+3 (after stripping padding)
-    # 4n+1 is NEVER valid as it represents an impossible partial byte
     remainder = len(encrypted_b64url) % 4
     if remainder == 1:
         raise ValueError(
             f"Invalid base64url-encoded string: length {len(encrypted_b64url)} "
             "is not valid (cannot be 1 more than a multiple of 4)"
         )
-
-    # Decode base64url to bytes (add padding if stripped)
     if remainder == 2:
         encrypted_b64url += '=='
     elif remainder == 3:
         encrypted_b64url += '='
     ciphertext = base64.urlsafe_b64decode(encrypted_b64url)
 
-    # Decrypt using ECIES
     plaintext = ecies.decrypt(DECRYPT_PRIVATE_KEY, ciphertext)
     return plaintext.decode('utf-8')
 
 
 def parse_env_params(query_params: dict) -> tuple[dict[str, str], dict[str, str]]:
-    """
-    Parse query parameters into environment variables.
-
-    Supports 4 prefixes:
-    - PLAIN_X=value     -> env_vars[X] = value
-    - FILE_X=content    -> env_file_vars[X] = content (written to temp file)
-    - ENC_X=encrypted   -> env_vars[X] = decrypt(encrypted)
-    - ENCFILE_X=encrypted -> env_file_vars[X] = decrypt(encrypted)
-
-    Args:
-        query_params: Dictionary of query parameters
-
-    Returns:
-        Tuple of (env_vars, env_file_vars)
-    """
-    env_vars = {}
-    env_file_vars = {}
+    env_vars: dict[str, str] = {}
+    env_file_vars: dict[str, str] = {}
 
     for key, value in query_params.items():
         if key.startswith('PLAIN_'):
-            var_name = key[6:]  # Strip 'PLAIN_'
-            env_vars[var_name] = value
-
+            env_vars[key[6:]] = value
         elif key.startswith('FILE_'):
-            var_name = key[5:]  # Strip 'FILE_'
-            env_file_vars[var_name] = value
-
+            env_file_vars[key[5:]] = value
         elif key.startswith('ENC_'):
-            var_name = key[4:]  # Strip 'ENC_'
-            env_vars[var_name] = decrypt_value(value)
-
+            env_vars[key[4:]] = decrypt_value(value)
         elif key.startswith('ENCFILE_'):
-            var_name = key[8:]  # Strip 'ENCFILE_'
-            env_file_vars[var_name] = decrypt_value(value)
+            env_file_vars[key[8:]] = decrypt_value(value)
 
     return env_vars, env_file_vars
 
 
 def validate_api_key(api_key: str) -> bool:
-    """Validate API key against allowed list."""
-    allowed_keys = os.environ.get('ALLOWED_API_KEYS', '').split(',')
-    allowed_keys = [k.strip() for k in allowed_keys if k.strip()]
-
+    allowed_keys = [k.strip() for k in os.environ.get('ALLOWED_API_KEYS', '').split(',') if k.strip()]
     if not allowed_keys:
         logger.warning("ALLOWED_API_KEYS not configured - rejecting all requests")
         return False
-
     return api_key in allowed_keys
 
 
+# =============================================================================
+# JSON-RPC helpers
+# =============================================================================
+
+def _collect_request_ids(body: Any) -> set:
+    """Return the set of JSON-RPC ids that require a response (notifications have no id)."""
+    msgs = body if isinstance(body, list) else [body]
+    ids: set = set()
+    for m in msgs:
+        if isinstance(m, dict) and 'id' in m and m['id'] is not None:
+            ids.add(m['id'])
+    return ids
+
+
+def _is_initialize(body: Any) -> bool:
+    msgs = body if isinstance(body, list) else [body]
+    return any(isinstance(m, dict) and m.get('method') == 'initialize' for m in msgs)
+
+
+def _jsonrpc_error(status: int, code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        {'jsonrpc': '2.0', 'id': None, 'error': {'code': code, 'message': message}},
+        status_code=status,
+    )
+
+
+# =============================================================================
+# Per-service command builders
+# =============================================================================
+
+def _build_analytics_command(env_vars: dict[str, str]) -> str:
+    return 'analytics-mcp'
+
+
+def _build_googleads_command(env_vars: dict[str, str]) -> str:
+    return 'google-ads-mcp'
+
+
+def _build_facebookads_command(env_vars: dict[str, str]) -> str:
+    token = env_vars.pop('FB_ACCESS_TOKEN', None)
+    if not token:
+        raise ValueError('FB_ACCESS_TOKEN required (use PLAIN_FB_ACCESS_TOKEN or ENC_FB_ACCESS_TOKEN)')
+    return f'python /app/facebook-ads-mcp/server.py --fb-token {shlex.quote(token)}'
+
+
+# =============================================================================
+# HTTP handlers
+# =============================================================================
+
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint for container platforms."""
     return JSONResponse({'status': 'healthy', 'service': 'digital-ads-remote-mcp'})
 
 
-# =============================================================================
-# SSE Transport Handlers
-# =============================================================================
+CommandBuilder = Callable[[dict[str, str]], str]
 
-async def handle_analytics_sse(request: Request) -> StreamingResponse:
-    """
-    SSE endpoint for Google Analytics MCP.
 
-    Opens a persistent connection:
-    1. Spawns analytics-mcp subprocess
-    2. Streams subprocess stdout as SSE events
-    3. Returns session_id in endpoint event for client to use with POST
+async def _handle_mcp(
+    request: Request,
+    service_name: str,
+    build_command: CommandBuilder,
+) -> Response:
+    """Streamable HTTP handler for POST/DELETE on /{service}/mcp."""
 
-    Query parameters:
-    - api_key            -> API key for authentication
-    - PLAIN_X=value      -> env var X=value
-    - FILE_X=content     -> env var X=/tmp/... (content written to file)
-    - ENC_X=encrypted    -> env var X=decrypt(encrypted)
-    - ENCFILE_X=encrypted -> env var X=/tmp/... (decrypted content in file)
-    """
-    print(f"[DEBUG] GET /analytics/sse called")
-
-    # Parse query params
-    query_params = dict(request.query_params)
-    print(f"[DEBUG] Query params: {list(query_params.keys())}")
-
-    # Validate API key
-    api_key = query_params.pop('api_key', '')
+    api_key = request.query_params.get('api_key', '')
     if not validate_api_key(api_key):
-        logger.warning("Invalid API key attempted for SSE")
-        return JSONResponse(
-            {'error': 'Unauthorized: Invalid API key'},
-            status_code=401
-        )
+        logger.warning(f"Invalid API key attempted for {service_name}/mcp")
+        return JSONResponse({'error': 'Unauthorized: Invalid API key'}, status_code=401)
 
-    # Parse environment variables
+    header_session_id = request.headers.get('mcp-session-id')
+
+    if request.method == 'DELETE':
+        if header_session_id:
+            await remove_session(header_session_id)
+        return Response(status_code=204)
+
     try:
-        env_vars, env_file_vars = parse_env_params(query_params)
-    except ValueError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32602, 'message': f'Invalid params: {str(e)}'}
-        }, status_code=400)
+        body = await request.json()
+    except Exception:
+        return _jsonrpc_error(400, -32700, 'Parse error: body is not valid JSON')
 
-    # Create session
-    print(f"[DEBUG] Creating MCP session...")
-    try:
-        session = await create_mcp_session(
-            command='analytics-mcp',
-            env_vars=env_vars,
-            env_file_vars=env_file_vars,
-        )
-        print(f"[DEBUG] Session created: {session.session_id}")
-    except Exception as e:
-        print(f"[DEBUG] Failed to create session: {e}")
-        logger.exception(f"Failed to create MCP session: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32603, 'message': f'Failed to start MCP server: {str(e)}'}
-        }, status_code=500)
+    new_session = False
+    if header_session_id:
+        session = await get_session(header_session_id)
+        if not session:
+            return _jsonrpc_error(404, -32603, 'Session not found or expired')
+    else:
+        if not _is_initialize(body):
+            return _jsonrpc_error(
+                400, -32600,
+                'Missing Mcp-Session-Id header; the first request must be an "initialize" request'
+            )
 
-    async def event_stream():
-        """Generate SSE events from subprocess stdout."""
+        query_params = {k: v for k, v in request.query_params.items() if k != 'api_key'}
         try:
-            # First, send the endpoint event with session info
-            # This tells the client where to POST messages
-            # MCP SSE spec: endpoint event data is just the raw URI, not JSON
-            endpoint_uri = f'/analytics/message?session_id={session.session_id}'
-            print(f"[DEBUG] SSE sending endpoint event: {endpoint_uri}")
-            yield f'event: endpoint\ndata: {endpoint_uri}\n\n'
+            env_vars, env_file_vars = parse_env_params(query_params)
+        except ValueError as e:
+            return _jsonrpc_error(400, -32602, f'Invalid params: {e}')
 
-            # Stream stdout lines as SSE message events
-            while True:
-                print(f"[DEBUG] SSE waiting for line from session {session.session_id}...")
-                line = await session.read_line()
-                if line is None:
-                    # Process ended or error
-                    print(f"[DEBUG] SSE got None from read_line, ending stream")
-                    break
-                if line:
-                    # Send as SSE message event
-                    print(f"[DEBUG] SSE sending message event: {line[:200]}...")
-                    yield f'event: message\ndata: {line}\n\n'
+        try:
+            command = build_command(env_vars)
+        except ValueError as e:
+            return _jsonrpc_error(400, -32602, str(e))
 
-        except asyncio.CancelledError:
-            print(f"[DEBUG] SSE connection cancelled for session {session.session_id}")
-            logger.info(f"SSE connection cancelled for session {session.session_id}")
+        try:
+            session = await create_mcp_session(command, env_vars, env_file_vars)
         except Exception as e:
-            print(f"[DEBUG] SSE error for session {session.session_id}: {e}")
-            logger.exception(f"Error in SSE stream for session {session.session_id}: {e}")
+            logger.exception(f"Failed to create {service_name} MCP session: {e}")
+            return _jsonrpc_error(500, -32603, f'Failed to start MCP server: {e}')
+
+        new_session = True
+
+    session_id = session.session_id
+    expected_ids = _collect_request_ids(body)
+
+    if not expected_ids:
+        try:
+            async for _ in session.process_jsonrpc(body):
+                pass
+        except RuntimeError as e:
+            return _jsonrpc_error(500, -32603, str(e))
+        return Response(status_code=202, headers={'Mcp-Session-Id': session_id})
+
+    async def event_stream() -> AsyncIterator[str]:
+        delivered = False
+        try:
+            async for line in session.process_jsonrpc(body):
+                delivered = True
+                yield f'event: message\ndata: {line}\n\n'
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"Error streaming /mcp for session {session_id}: {e}")
         finally:
-            print(f"[DEBUG] SSE cleanup for session {session.session_id}")
-            await remove_session(session.session_id)
+            if new_session and not delivered:
+                await remove_session(session_id)
 
     return StreamingResponse(
         event_stream(),
         media_type='text/event-stream',
         headers={
+            'Mcp-Session-Id': session_id,
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',  # Disable nginx buffering
-        }
+            'X-Accel-Buffering': 'no',
+        },
     )
 
 
-async def handle_analytics_message(request: Request) -> JSONResponse:
-    """
-    POST endpoint to send messages to an MCP session.
-
-    Query parameters:
-    - session_id: The session ID returned in SSE endpoint event
-
-    Body: JSON-RPC message to send to the MCP server
-    """
-    print(f"[DEBUG] POST /analytics/message called")
-    print(f"[DEBUG] Query params: {dict(request.query_params)}")
-
-    session_id = request.query_params.get('session_id')
-    if not session_id:
-        print(f"[DEBUG] No session_id provided")
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32602, 'message': 'session_id required'}
-        }, status_code=400)
-
-    print(f"[DEBUG] Looking up session: {session_id}")
-    session = await get_session(session_id)
-    if not session:
-        print(f"[DEBUG] Session not found: {session_id}")
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32603, 'message': 'Session not found or expired'}
-        }, status_code=404)
-
-    try:
-        body = await request.json()
-        print(f"[DEBUG] Message body: {json.dumps(body)[:500]}")
-
-        if not isinstance(body, dict):
-            return JSONResponse({
-                'jsonrpc': '2.0',
-                'id': None,
-                'error': {'code': -32600, 'message': 'Invalid request'}
-            }, status_code=400)
-
-        # Normalize: ensure 'params' exists
-        if 'params' not in body:
-            body['params'] = {}
-
-        await session.send_message(body)
-        print(f"[DEBUG] Message sent successfully")
-        return JSONResponse({'status': 'sent'})
-
-    except RuntimeError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32603, 'message': str(e)}
-        }, status_code=500)
-
-    except Exception as e:
-        logger.exception(f"Error sending message to session {session_id}: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0',
-            'id': None,
-            'error': {'code': -32603, 'message': f'Internal error: {str(e)}'}
-        }, status_code=500)
+async def handle_analytics_mcp(request: Request) -> Response:
+    return await _handle_mcp(request, 'analytics', _build_analytics_command)
 
 
-# -----------------------------------------------------------------------------
-# Google Ads SSE Handlers
-# -----------------------------------------------------------------------------
-
-async def handle_googleads_sse(request: Request) -> StreamingResponse:
-    """
-    SSE endpoint for Google Ads MCP.
-
-    Query parameters:
-    - api_key            -> API key for authentication
-    - PLAIN_X=value      -> env var X=value
-    - FILE_X=content     -> env var X=/tmp/... (content written to file)
-    - ENC_X=encrypted    -> env var X=decrypt(encrypted)
-    - ENCFILE_X=encrypted -> env var X=/tmp/... (decrypted content in file)
-    """
-    print(f"[DEBUG] GET /googleads/sse called")
-
-    query_params = dict(request.query_params)
-    print(f"[DEBUG] Query params: {list(query_params.keys())}")
-
-    api_key = query_params.pop('api_key', '')
-    if not validate_api_key(api_key):
-        logger.warning("Invalid API key attempted for Google Ads SSE")
-        return JSONResponse({'error': 'Unauthorized: Invalid API key'}, status_code=401)
-
-    try:
-        env_vars, env_file_vars = parse_env_params(query_params)
-    except ValueError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32602, 'message': f'Invalid params: {str(e)}'}
-        }, status_code=400)
-
-    print(f"[DEBUG] Creating Google Ads MCP session...")
-    try:
-        session = await create_mcp_session(
-            command='google-ads-mcp',
-            env_vars=env_vars,
-            env_file_vars=env_file_vars,
-        )
-        print(f"[DEBUG] Session created: {session.session_id}")
-    except Exception as e:
-        print(f"[DEBUG] Failed to create session: {e}")
-        logger.exception(f"Failed to create Google Ads MCP session: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': f'Failed to start MCP server: {str(e)}'}
-        }, status_code=500)
-
-    async def event_stream():
-        try:
-            endpoint_uri = f'/googleads/message?session_id={session.session_id}'
-            print(f"[DEBUG] SSE sending endpoint event: {endpoint_uri}")
-            yield f'event: endpoint\ndata: {endpoint_uri}\n\n'
-
-            while True:
-                line = await session.read_line()
-                if line is None:
-                    break
-                if line:
-                    print(f"[DEBUG] SSE sending message event: {line[:200]}...")
-                    yield f'event: message\ndata: {line}\n\n'
-
-        except asyncio.CancelledError:
-            logger.info(f"SSE connection cancelled for session {session.session_id}")
-        except Exception as e:
-            logger.exception(f"Error in SSE stream for session {session.session_id}: {e}")
-        finally:
-            await remove_session(session.session_id)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type='text/event-stream',
-        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'}
-    )
+async def handle_googleads_mcp(request: Request) -> Response:
+    return await _handle_mcp(request, 'googleads', _build_googleads_command)
 
 
-async def handle_googleads_message(request: Request) -> JSONResponse:
-    """POST endpoint to send messages to a Google Ads MCP session."""
-    session_id = request.query_params.get('session_id')
-    if not session_id:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32602, 'message': 'session_id required'}
-        }, status_code=400)
-
-    session = await get_session(session_id)
-    if not session:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': 'Session not found or expired'}
-        }, status_code=404)
-
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            return JSONResponse({
-                'jsonrpc': '2.0', 'id': None,
-                'error': {'code': -32600, 'message': 'Invalid request'}
-            }, status_code=400)
-
-        if 'params' not in body:
-            body['params'] = {}
-
-        await session.send_message(body)
-        return JSONResponse({'status': 'sent'})
-
-    except RuntimeError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': str(e)}
-        }, status_code=500)
-    except Exception as e:
-        logger.exception(f"Error sending message to session {session_id}: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': f'Internal error: {str(e)}'}
-        }, status_code=500)
+async def handle_facebookads_mcp(request: Request) -> Response:
+    return await _handle_mcp(request, 'facebookads', _build_facebookads_command)
 
 
-# -----------------------------------------------------------------------------
-# Facebook Ads SSE Handlers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# ASGI app
+# =============================================================================
 
-async def handle_facebookads_sse(request: Request) -> StreamingResponse:
-    """
-    SSE endpoint for Facebook Ads MCP.
-
-    Query parameters:
-    - api_key            -> API key for authentication
-    - PLAIN_FB_ACCESS_TOKEN or ENC_FB_ACCESS_TOKEN -> Required Facebook token
-    - PLAIN_X=value      -> env var X=value
-    - FILE_X=content     -> env var X=/tmp/... (content written to file)
-    - ENC_X=encrypted    -> env var X=decrypt(encrypted)
-    - ENCFILE_X=encrypted -> env var X=/tmp/... (decrypted content in file)
-    """
-    print(f"[DEBUG] GET /facebookads/sse called")
-
-    query_params = dict(request.query_params)
-    print(f"[DEBUG] Query params: {list(query_params.keys())}")
-
-    api_key = query_params.pop('api_key', '')
-    if not validate_api_key(api_key):
-        logger.warning("Invalid API key attempted for Facebook Ads SSE")
-        return JSONResponse({'error': 'Unauthorized: Invalid API key'}, status_code=401)
-
-    try:
-        env_vars, env_file_vars = parse_env_params(query_params)
-    except ValueError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32602, 'message': f'Invalid params: {str(e)}'}
-        }, status_code=400)
-
-    # Extract Facebook token (required)
-    fb_token = env_vars.pop('FB_ACCESS_TOKEN', None)
-    if not fb_token:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32602, 'message': 'FB_ACCESS_TOKEN required (use PLAIN_FB_ACCESS_TOKEN or ENC_FB_ACCESS_TOKEN)'}
-        }, status_code=400)
-
-    print(f"[DEBUG] Creating Facebook Ads MCP session...")
-    try:
-        # Token passed via command line argument
-        session = await create_mcp_session(
-            command=f'python /app/facebook-ads-mcp/server.py --fb-token {shlex.quote(fb_token)}',
-            env_vars=env_vars,
-            env_file_vars=env_file_vars,
-        )
-        print(f"[DEBUG] Session created: {session.session_id}")
-    except Exception as e:
-        print(f"[DEBUG] Failed to create session: {e}")
-        logger.exception(f"Failed to create Facebook Ads MCP session: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': f'Failed to start MCP server: {str(e)}'}
-        }, status_code=500)
-
-    async def event_stream():
-        try:
-            endpoint_uri = f'/facebookads/message?session_id={session.session_id}'
-            print(f"[DEBUG] SSE sending endpoint event: {endpoint_uri}")
-            yield f'event: endpoint\ndata: {endpoint_uri}\n\n'
-
-            while True:
-                line = await session.read_line()
-                if line is None:
-                    break
-                if line:
-                    print(f"[DEBUG] SSE sending message event: {line[:200]}...")
-                    yield f'event: message\ndata: {line}\n\n'
-
-        except asyncio.CancelledError:
-            logger.info(f"SSE connection cancelled for session {session.session_id}")
-        except Exception as e:
-            logger.exception(f"Error in SSE stream for session {session.session_id}: {e}")
-        finally:
-            await remove_session(session.session_id)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type='text/event-stream',
-        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'}
-    )
-
-
-async def handle_facebookads_message(request: Request) -> JSONResponse:
-    """POST endpoint to send messages to a Facebook Ads MCP session."""
-    session_id = request.query_params.get('session_id')
-    if not session_id:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32602, 'message': 'session_id required'}
-        }, status_code=400)
-
-    session = await get_session(session_id)
-    if not session:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': 'Session not found or expired'}
-        }, status_code=404)
-
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            return JSONResponse({
-                'jsonrpc': '2.0', 'id': None,
-                'error': {'code': -32600, 'message': 'Invalid request'}
-            }, status_code=400)
-
-        if 'params' not in body:
-            body['params'] = {}
-
-        await session.send_message(body)
-        return JSONResponse({'status': 'sent'})
-
-    except RuntimeError as e:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': str(e)}
-        }, status_code=500)
-    except Exception as e:
-        logger.exception(f"Error sending message to session {session_id}: {e}")
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': None,
-            'error': {'code': -32603, 'message': f'Internal error: {str(e)}'}
-        }, status_code=500)
-
-
-# Create Starlette ASGI application
 app = Starlette(
     debug=False,
     routes=[
         Route('/', endpoint=health_check, methods=['GET']),
         Route('/health', endpoint=health_check, methods=['GET']),
-        # Google Analytics SSE transport
-        Route('/analytics/sse', endpoint=handle_analytics_sse, methods=['GET']),
-        Route('/analytics/message', endpoint=handle_analytics_message, methods=['POST']),
-        # Google Ads SSE transport
-        Route('/googleads/sse', endpoint=handle_googleads_sse, methods=['GET']),
-        Route('/googleads/message', endpoint=handle_googleads_message, methods=['POST']),
-        # Facebook Ads SSE transport
-        Route('/facebookads/sse', endpoint=handle_facebookads_sse, methods=['GET']),
-        Route('/facebookads/message', endpoint=handle_facebookads_message, methods=['POST']),
+        Route('/analytics/mcp', endpoint=handle_analytics_mcp, methods=['POST', 'DELETE']),
+        Route('/googleads/mcp', endpoint=handle_googleads_mcp, methods=['POST', 'DELETE']),
+        Route('/facebookads/mcp', endpoint=handle_facebookads_mcp, methods=['POST', 'DELETE']),
     ],
     middleware=[
         Middleware(
             CORSMiddleware,
-            allow_origins=['*'],  # Configure appropriately for production
-            allow_methods=['GET', 'POST', 'OPTIONS'],
-            allow_headers=['*'],
-            expose_headers=['*'],
+            allow_origins=['*'],
+            allow_methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allow_headers=['*', 'Mcp-Session-Id'],
+            expose_headers=['Mcp-Session-Id'],
         )
-    ]
+    ],
 )
 
 
 def run(host: str = '0.0.0.0', port: int = 8080):
-    """Run the remote MCP server."""
     import uvicorn
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
 
     logger.info(f"Starting Digital Ads Remote MCP Server on {host}:{port}")
-    logger.info("Transport: HTTP JSON-RPC (subprocess isolation)")
-    logger.info("Authentication: API Key + Per-request Developer Token")
+    logger.info("Transport: Streamable HTTP (/mcp) over stdio subprocess")
+    logger.info("Authentication: API Key (api_key query param)")
 
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        log_level='info',
-    )
+    uvicorn.run(app, host=host, port=port, log_level='info')
 
 
 if __name__ == '__main__':
