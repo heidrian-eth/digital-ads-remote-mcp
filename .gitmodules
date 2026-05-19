@@ -1,6 +1,7 @@
 [submodule "google-ads-mcp"]
 	path = google-ads-mcp
-	url = https://github.com/googleads/google-ads-mcp
+	url = https://github.com/heidrian-eth/google-ads-mcp
+	branch = heidrian-mcc-fix
 [submodule "google-analytics-mcp"]
 	path = google-analytics-mcp
 	url = https://github.com/googleanalytics/google-analytics-mcp.git
